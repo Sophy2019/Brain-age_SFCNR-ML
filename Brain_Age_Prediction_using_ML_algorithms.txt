@@ -1,0 +1,1875 @@
+################################################# 
+########### Brain Age Prediction code ###########
+################################################# 
+
+
+
+### Raw Dataset   
+  
+* Training HC (N=**541**)
+* KU HC (N=**209**)
+* CNUH patient (N=**292**)
+    * TRS : 46
+    * FE-SSD : 72
+
+* Input data : the 77 gray matter FreeSurfer features.
+    1. ICV : 1 variable  
+    2. Subcortical volume : 8 variables   
+    3. Mean cortical thickness : 34 variables  
+    4. Mean cortical surface area : 34 variables  
+    Total **77 variables**  
+
+ 
+
+### Strategy of brain age prediction
+1. Sample exclusion criteria 
+    - Exclude samples below 18 years and above 75 years old.
+    - Exclude samples included in scanning sites with less than 20 control samples.
+
+2. Data partitioning
+    - Train HC Control : Healthy controls from CNUH+Beijing.
+    - Test HC Control : Healthy control from KU.
+    - Test Patient : Patient from CNUH.
+
+3. Model development 
+    - Perform Combat to remove site effect.
+    - After removing site effect, build brain age prediction model based on *the 77 gray matter FreeSurfer features* using Ridge, SVR, RVR, **10-fold Nested cross-validation (10 time)**.  
+  
+4. Test prediction model in **Test control data**, **CNUH patient** using variance explained on cross-validation (*VEcv*), Mean absoulte error (*MAE*), Peason correlation coefficient ($r$).
+
+5. Calculate Brain-PAD (predicted Age - chronological Age) and corrected Brain-PAD (Goodness-of-fit test)  
+
+ 
+
+### Data Process
+
+library(openxlsx)
+library(dplyr)
+
+setwd("/home/Brain_Age_Prediction/")
+whole_dat <- read.xlsx("2021-1174-BrainAge-sMRI-Final.xlsx",sheet=1,startRow = 1) #1174
+ 
+
+##### Sample exclusion with Age & Site
+
+# Age (filtering subject with age <18 or >75)
+whole_dat$Age <- as.numeric(whole_dat$Age)
+whole_dat$Age <- floor(whole_dat$Age)
+sum(whole_dat$Age < 18 | whole_dat$Age > 75)
+table(whole_dat$Site[which(whole_dat$Age < 18 | whole_dat$Age > 75)])
+whole_dat <- whole_dat[-which(whole_dat$Age < 18 | whole_dat$Age > 75),] #1075
+
+# Site
+table(whole_dat$Site)
+whole_dat <- whole_dat[-which(whole_dat$Site=="HNU" | whole_dat$Site=="IACAS"),]
+
+table(whole_dat$Site_2)
+table(whole_dat$Status)
+
+# Education
+whole_dat$Edu[whole_dat$Edu==1 & !is.na(whole_dat$Edu)] <- 7.5
+whole_dat$Edu[whole_dat$Edu==2 & !is.na(whole_dat$Edu)] <- 14
+whole_dat$Edu[whole_dat$Edu==3 & !is.na(whole_dat$Edu)] <- 18
+whole_dat$Edu <- as.numeric(whole_dat$Edu)
+ 
+
+##### Reduce and seperation Reduce of dataset(KU reslut reference)
+table(whole_dat$Status)
+table(whole_dat$Site_2)
+
+'%!in%' <- Negate('%in%')
+whole_dat <- whole_dat %>% filter(whole_dat$Freesurfer_Number %!in% c("H148","H252","J373"))
+whole_dat <- whole_dat %>% filter(whole_dat$Freesurfer_Number %!in% c("K33","K49","K65","K75","K216"))
+
+HC_data <- whole_dat[whole_dat$Status=="Control",]
+Patient_data <- setdiff(whole_dat,HC_data)
+
+HC_data <- HC_data[,c(-2)]
+Patient_data <- Patient_data[,c(-2)]
+ 
+
+
+### Combat
+  
+library(sva)
+library(factoextra)
+
+whole_dat$Site <- ifelse(whole_dat$Site=="CNUH","JBUH",whole_dat$Site)
+whole_dat$Site <- ifelse(whole_dat$Site=="KU","KUAH",whole_dat$Site)
+
+batch <- as.numeric(as.factor(whole_dat$Site))
+mod <- model.matrix(~1+Age+Sex+Status,data=whole_dat)
+Combat_dat <- ComBat(dat=t(whole_dat[,9:85]), batch=batch, mod=mod)
+Combat_dat <- t(Combat_dat)
+Combat_dat <- data.frame(SubjID=whole_dat$Freesurfer_Number,Age=whole_dat$Age,
+                         Sex=whole_dat$Sex,Site=whole_dat$Site,Combat_dat)
+
+Train_HC_data <- Combat_dat[grep("H|J",whole_dat$Freesurfer_Number),]
+Test_HC_data <- Combat_dat[grep("K",whole_dat$Freesurfer_Number),]
+Test_Patient_dat <- Combat_dat[grep("C|T",whole_dat$Freesurfer_Number),]
+
+setwd("/home/Brain_Age_Prediction/")
+Patient_clinical <- read.xlsx("Patient_clinical_292_0630.xlsx",startRow=1)
+Patient_clinical <- Patient_clinical[match(Test_Patient_dat$SubjID,Patient_clinical$freesurfer_ID),]
+ID_FESSD <- Patient_clinical$freesurfer_ID[!is.na(Patient_clinical$`FE-SSD`)]
+ID_schizo <- Patient_clinical$freesurfer_ID[Patient_clinical$Diagnosis=="schizophrenia"]
+
+Test_TRS_dat <- Test_Patient_dat[grep("T",Test_Patient_dat$SubjID),]
+Test_FESSD_dat <- Test_Patient_dat[Test_Patient_dat$SubjID %in% ID_FESSD,]
+Test_schizophrenia_dat <- Test_Patient_dat[Test_Patient_dat$SubjID %in% ID_schizo,]
+
+par(mfrow=c(3,2))
+plot(density(Train_HC_data$Age,from=15,to=80),main="Age of Train control data")
+plot(density(Test_HC_data$Age,from=15,to=80),main="Age of Test control data")
+plot(density(Test_Patient_dat$Age,from=15,to=80),main="Age of Test patient data")
+plot(density(Test_schizophrenia_dat$Age,from=15,to=80),main="Age of Schizophrenia data")
+plot(density(Test_FESSD_dat$Age,from=15,to=80),main="Age of Test FE-SSD data")
+plot(density(Test_TRS_dat$Age,from=15,to=80),main="Age of Test TRS data")
+
+PC <- prcomp(scale(whole_dat[,9:85]))
+A <- fviz_pca_ind(PC, label="none", habillage=whole_dat$Site,
+     addEllipses=TRUE, ellipse.level=0.95, palette = "Dark2",title="Before adjustment") +
+  labs(x="Dimension1 (29.0%)", y="Dimension2 (20.7%)")
+
+PC <- prcomp(scale(Combat_dat[,5:81]))
+B <- fviz_pca_ind(PC, label="none", habillage=Combat_dat$Site,
+     addEllipses=TRUE, ellipse.level=0.95, palette = "Dark2",title="After adjustment") + 
+  labs(x="Dimension1 (30.0%)", y="Dimension2 (20.8%)")
+
+library(MASS)
+f <- as.formula(paste("Site~",paste(colnames(whole_dat)[9:85],collapse ="+"),sep=""))
+lda <- lda(f, data = whole_dat)
+lda.value <- predict(lda)
+lda.data <- data.frame(Site = whole_dat$Site, lda = lda.value$x)
+C <- ggplot(lda.data) + geom_point(aes(lda.LD1, lda.LD2, colour = Site), size = 2.5)
+
+lda <- lda(f, data = Combat_dat)
+lda.value <- predict(lda)
+lda.data <- data.frame(Site = Combat_dat$Site, lda = lda.value$x)
+D <- ggplot(lda.data) + geom_point(aes(lda.LD1, lda.LD2, colour = Site), size = 2.5)
+A;B;C;D
+
+library(ggpubr)
+png("s1.png", width = 1200, height = 800)
+ggarrange(A,B,C,D, 
+          labels = c("A","B","C","D"), 
+          ncol = 2, nrow = 2,
+          font.label = list(size=20))
+dev.off()
+ 
+
+ 
+# PCA outlier dection in Train HC data
+PC <- prcomp(scale(Train_HC_data[,5:81]))
+fviz_pca_ind(PC,col.ind = "#00AFBB",repel=TRUE)
+fviz_pca_ind(PC, addEllipses=TRUE, ellipse.level=0.95, palette = "Dark2", title="") + labs(x="Dimension1 (30.3%)", y="Dimension2 (18.1%)")
+out <- c(631,95,171,75,233,646,159,766,223,247,267,5,154,186,192,268,36,238,256,3,249,41,211,197,657) #1067
+
+Train_HC_data$SubjID[rownames(Train_HC_data) %in% out]         
+length(out) # 25
+sum(!rownames(Train_HC_data) %in% out) # 569 --> 544
+Train_HC_data <- Train_HC_data[which(!rownames(Train_HC_data) %in% out),]
+
+ 
+
+#### Age distribution
+
+Train_HC_data$group<- "A"
+Test_HC_data$group<- "B"
+Test_schizophrenia_dat$group<- "C"
+Test_FESSD_dat$group<- "D"
+Test_TRS_dat$group<- "E"
+
+whole_age <- rbind(Train_HC_data[,c(1:2,82)],Test_HC_data[,c(1:2,82)],Test_schizophrenia_dat[,c(1:2,82)],Test_FESSD_dat[,c(1:2,82)],Test_TRS_dat[,c(1:2,82)])
+
+library(ggplot2)
+library(ggtext)
+library(cowplot)
+library(tidyr)
+library(dplyr)
+
+thm <- theme_minimal() + theme(text = element_text(size = 11))
+
+plot <- whole_age %>%
+  ggplot(mapping = aes(x=Age))+
+  geom_density()+
+  facet_wrap(group ~ ., ncol=1)+
+  thm+
+  theme(legend.position="none")+
+  labs(x = "Age", y = "Count density")+
+  theme(
+    strip.text = element_textbox(
+      size = 10, face = "bold"))
+
+plot <- plot + theme(
+    panel.background = element_rect(fill = "transparent"), # bg of the panel
+    plot.background = element_rect(fill = "transparent", color = NA), # bg of the plot
+    panel.grid.major = element_blank(), # get rid of major grid
+    panel.grid.minor = element_blank(), # get rid of minor grid
+    legend.background = element_rect(fill = "transparent"), # get rid of legend bg
+    legend.box.background = element_rect(fill = "transparent"), # get rid of legend panel bg
+    legend.key = element_rect(fill = "transparent", colour = NA), # get rid of key legend fill, and of the surrounding
+    axis.line = element_line(colour = "black") # adding a black line for x and y axis
+)
+
+ 
+ 
+#### Demographics and Clinical characteristics
+
+#Train_HC vs Test_HC vs Schizophrenia
+summary_dat_3 <- data.frame(rbind(Train_HC_data,Test_HC_data,Test_schizophrenia_dat))
+Edu_dat <- whole_dat[,c(1,6)]
+colnames(Edu_dat)[1] <- c("SubjID")
+summary_dat_3 <- inner_join(summary_dat_3,Edu_dat,by="SubjID")
+summary_dat_3$set <- rep(c(1:3),c(nrow(Train_HC_data),nrow(Test_HC_data),nrow(Test_schizophrenia_dat)))
+summary_dat_3$set <- as.factor(summary_dat_3$set)
+
+
+three.fun_var <- function(var,group,DATA) {
+  a11 <- paste("n=",sum(!is.na(DATA[var][DATA[group]==1])),sep="")
+  a21 <- paste(round(mean(DATA[var][DATA[group]==1],na.rm = T),2),
+               round(sd(DATA[var][DATA[group]==1],na.rm = T),2),sep = " ± ")
+  a_1 <- paste(a21,"(",a11,")",sep="")
+  
+  a12 <- paste("n=",sum(!is.na(DATA[var][DATA[group]==2])),sep="")
+  a22 <- paste(round(mean(DATA[var][DATA[group]==2],na.rm = T),2),
+               round(sd(DATA[var][DATA[group]==2],na.rm = T),2),sep = " ± ")
+  a_2 <-  paste(a22,"(",a12,")",sep="")
+  
+  a13 <- paste("n=",sum(!is.na(DATA[var][DATA[group]==3])),sep="")
+  a23 <- paste(round(mean(DATA[var][DATA[group]==3],na.rm = T),2),
+               round(sd(DATA[var][DATA[group]==3],na.rm = T),2),sep = " ± ")
+  a_3 <-  paste(a23,"(",a13,")",sep="")
+  
+  f <- as.formula(paste(var,"~",group))
+  Aov <- aov(lm(f,data=DATA))
+  b <- round(summary(Aov)[[1]][["Pr(>F)"]][1],4)
+  
+  y <- DATA[var][,1]
+  group <-DATA[group][,1]
+  posthoc <- pairwise.t.test(y, group, "bonferroni")
+  posthoc <- data.frame(posthoc[3])
+  c <- round(posthoc[1,1],4)
+  d <- round(posthoc[2,1],4)
+  e <- round(posthoc[2,2],4)
+  return(matrix(c(a_1,a_2,a_3,b,c,d,e),1,7))
+}
+
+
+TABLE_clinical_3 <- three.fun_var("Age","set",summary_dat_3) 
+TABLE_clinical_3 <- rbind(TABLE_clinical_3,three.fun_var("Edu","set",summary_dat_3))
+t <- table(summary_dat_3$Sex,summary_dat_3$set)
+Sex <- c(paste(t[,1],collapse = "/"),paste(t[,2],collapse = "/"),paste(t[,3],collapse = "/"),round(chisq.test(t)$p.value,4))
+Sex <- c(Sex,NA,NA,NA)
+TABLE_clinical_3 <- rbind(Sex,TABLE_clinical_3)
+rownames(TABLE_clinical_3) <- c("Sex(M/F)","Age","Education, years")
+colnames(TABLE_clinical_3) <- c("Health control (CNUH, Beijing)","Health control (KU)","Schizophrenia (CNUH)","p-value","Group 1 vs Group 2", "Group 1 vs Group 3","Group 2 vs Group 3")
+TABLE_clinical_3
+ 
+
+
+ 
+#TestHC vs FE-SSD vs TRS
+summary_dat_p3 <- data.frame(rbind(Test_HC_data,Test_FESSD_dat,Test_TRS_dat))
+summary_dat_p3 <- inner_join(summary_dat_p3,Edu_dat,by="SubjID")
+summary_dat_p3$set <- rep(c(1:3),c(nrow(Test_HC_data),nrow(Test_FESSD_dat),nrow(Test_TRS_dat)))
+summary_dat_p3$set <- as.factor(summary_dat_p3$set)
+
+
+TABLE_clinical_p3 <- three.fun_var("Age","set",summary_dat_p3) 
+TABLE_clinical_p3 <- rbind(TABLE_clinical_p3,three.fun_var("Edu","set",summary_dat_p3))
+t <- table(summary_dat_p3$Sex,summary_dat_p3$set)
+Sex <- c(paste(t[,1],collapse = "/"),paste(t[,2],collapse = "/"),paste(t[,3],collapse = "/"),round(chisq.test(t)$p.value,3))
+Sex <- c(Sex,NA,NA,NA)
+TABLE_clinical_p3 <- rbind(Sex,TABLE_clinical_p3)
+rownames(TABLE_clinical_p3) <- c("Sex(M/F)","Age","Education, years")
+colnames(TABLE_clinical_p3) <- c("Test HC","FE-SSD","TRS","p-value","Group 1 vs Group 2", "Group 1 vs Group 3","Group 2 vs Group 3")
+TABLE_clinical_p3
+ 
+
+
+ 
+
+#### Comparison of the 77 gray matter Freesurfer features 
+
+ 
+ 
+three.fun_var <- function(var,group,DATA) {
+  a11 <- paste("n=",sum(!is.na(DATA[var][DATA[group]==1])),sep="")
+  a21 <- paste(round(mean(DATA[var][DATA[group]==1],na.rm = T),2),
+               round(sd(DATA[var][DATA[group]==1],na.rm = T),2),sep = " ± ")
+  a_1 <- paste(a21,"(",a11,")",sep="")
+  
+  a12 <- paste("n=",sum(!is.na(DATA[var][DATA[group]==2])),sep="")
+  a22 <- paste(round(mean(DATA[var][DATA[group]==2],na.rm = T),2),
+               round(sd(DATA[var][DATA[group]==2],na.rm = T),2),sep = " ± ")
+  a_2 <-  paste(a22,"(",a12,")",sep="")
+  
+  a13 <- paste("n=",sum(!is.na(DATA[var][DATA[group]==3])),sep="")
+  a23 <- paste(round(mean(DATA[var][DATA[group]==3],na.rm = T),2),
+               round(sd(DATA[var][DATA[group]==3],na.rm = T),2),sep = " ± ")
+  a_3 <-  paste(a23,"(",a13,")",sep="")
+  
+  f <- as.formula(paste(var,"~","set"))
+  Aov <- aov(lm(f,data=DATA))
+  b <- round(summary(Aov)[[1]][["Pr(>F)"]][1],4)
+
+  y <- DATA[var][,1]
+  group <-DATA[group][,1]
+  posthoc <- pairwise.t.test(y, group, "bonferroni")
+  posthoc <- data.frame(posthoc[3])
+  c <- round(posthoc[1,1],4)
+  d <- round(posthoc[2,1],4)
+  e <- round(posthoc[2,2],4)
+  
+  f1 <- as.formula(paste(var,"~","Age + Sex + Edu + set"))
+  Aov1 <- aov(lm(f1,data=DATA))
+  f <- round(summary(Aov1)[[1]][["Pr(>F)"]][4],4)
+  return(matrix(c(a_1,a_2,a_3,b,c,d,e,f),1,8))
+}
+
+conti_var <- setdiff(colnames(summary_dat_3),c("SubjID","Age","Site","Sex","set","Edu"))
+
+TABLE_sMRI_3group <- NULL
+for (i in 1:length(conti_var)){
+  TABLE_sMRI_3group  <- rbind(TABLE_sMRI_3group,three.fun_var(conti_var[i],"set",summary_dat_3))
+}
+rownames(TABLE_sMRI_3group) <- conti_var
+colnames(TABLE_sMRI_3group) <- c("Health control (CNUH, Beijing)","Health control (KU)","Schizophrenia (CNUH)","p-value","Group 1 vs Group 2", "Group 1 vs Group 3","Group 2 vs Group 3","age.sex.edu.adj-p")
+TABLE_sMRI_3group <- data.frame(TABLE_sMRI_3group)
+TABLE_sMRI_3group$p.value <- as.numeric(paste(TABLE_sMRI_3group$p.value))
+TABLE_sMRI_3group$bonf.adj.p.value <- p.adjust(TABLE_sMRI_3group$p.value,method="bonferroni")
+TABLE_sMRI_3group$bonf.age.sex.edu.adj.p.value <- p.adjust(TABLE_sMRI_3group$age.sex.edu.adj.p,method="bonferroni")
+TABLE_sMRI_3group
+ 
+
+
+
+
+ 
+
+### Ridge (Nested CV)
+
+library(caret)
+library(parallel)
+
+Nfolds <- 10
+
+f <- as.formula(paste("Age~",paste(colnames(Train_HC_data)[5:81],collapse = "+"),sep=""))
+fitcontrol <- trainControl(method = "repeatedcv", number=Nfolds, search = "random")
+
+ridge.fun <- function(N,i){
+  Nfolds <- N
+  set.seed(i)
+  outer_folds <- createFolds(Train_HC_data$Age,k=Nfolds)
+  cv.glmnet <- lapply(outer_folds,function(index) {
+    tr <- Train_HC_data[-index,]
+    ts <- Train_HC_data[index,]
+    fit <- train(f,data=tr,method="ridge",metric="MAE",
+               trControl=fitcontrol)
+    c(postResample(predict(fit,ts),ts$Age),lambda=fit$bestTune$lambda)
+    })
+}
+
+Ntimes <- 10
+RES <- NULL
+for(i in 1:Ntimes){
+  res <- mclapply(10,i,FUN=ridge.fun,mc.cores = 6)
+  RES <- rbind(RES,t(data.frame(res)))
+}
+ 
+library(glmnet)
+ridge.fit <- glmnet(as.matrix(Train_HC_data[,c(5:81)]),Train_HC_data[,2],
+                    alpha=0,lambda = RES[,4][which.min(RES[,3])])
+
+
+
+JBUH_HC_data <- Train_HC_data[Train_HC_data$Site=="JBUH",]
+ctrl_pred_age <- predict(ridge.fit, newx = as.matrix(JBUH_HC_data[,5:81]))
+train_error_ctrl_rid <- ctrl_pred_age-JBUH_HC_data$Age
+
+par(mfrow=c(1,1))
+plot(ctrl_pred_age,JBUH_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (JBUH control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(JBUH_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(JBUH_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(train_error_ctrl_rid)/length(train_error_ctrl_rid)),4)),
+                paste("VEcv=",round(1-sum(train_error_ctrl_rid^2/(var(JBUH_HC_data$Age)*(length(JBUH_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+
+
+
+# Train Control
+
+ctrl_pred_age <- predict(ridge.fit, newx = as.matrix(Train_HC_data[,5:81]))
+train_error_ctrl_rid <- ctrl_pred_age-Train_HC_data$Age
+
+par(mfrow=c(1,1))
+plot(ctrl_pred_age,Train_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Train control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(Train_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(Train_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(train_error_ctrl_rid)/length(train_error_ctrl_rid)),4)),
+                paste("VEcv=",round(1-sum(train_error_ctrl_rid^2/(var(Train_HC_data$Age)*(length(Train_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+# Test Control
+
+ctrl_pred_age <- predict(ridge.fit, newx = as.matrix(Test_HC_data[,5:81]))
+test_error_ctrl_rid <- ctrl_pred_age-Test_HC_data$Age
+
+plot(ctrl_pred_age,Test_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Test control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(Test_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(Test_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(test_error_ctrl_rid)/length(test_error_ctrl_rid)),4)),
+                paste("VEcv=",round(1-sum(test_error_ctrl_rid^2/(var(Test_HC_data$Age)*(length(Test_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+# Patient
+
+pat_pred_age <- predict(ridge.fit, newx = as.matrix(Test_Patient_dat[,5:81]))
+test_error_pat_rid <- pat_pred_age-Test_Patient_dat$Age
+
+plot(pat_pred_age,Test_Patient_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Patient)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_Patient_dat$Age,pat_pred_age),4)),
+                          paste("R2=",round(cor(Test_Patient_dat$Age,pat_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_pat_rid)/length(test_error_pat_rid)),4)),
+paste("VEcv=",round(1-sum(test_error_pat_rid^2/(var(Test_Patient_dat$Age)*(length(Test_Patient_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - Schizo
+sch_pred_age <- predict(ridge.fit, newx = as.matrix(Test_schizophrenia_dat[,5:81]))
+test_error_sch_rid <- sch_pred_age-Test_schizophrenia_dat$Age
+
+plot(sch_pred_age,Test_schizophrenia_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Schizophrenia)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_schizophrenia_dat$Age,sch_pred_age),4)),
+                          paste("R2=",round(cor(Test_schizophrenia_dat$Age,sch_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_sch_rid)/length(test_error_sch_rid)),4)),
+paste("VEcv=",round(1-sum(test_error_sch_rid^2/(var(Test_schizophrenia_dat$Age)*(length(Test_schizophrenia_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - TRS
+TRS_pred_age <- predict(ridge.fit, newx = as.matrix(Test_TRS_dat[,5:81]))
+test_error_trs_rid <- TRS_pred_age-Test_TRS_dat$Age
+
+plot(TRS_pred_age,Test_TRS_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (TRS)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_TRS_dat$Age,TRS_pred_age),4)),
+                          paste("R2=",round(cor(Test_TRS_dat$Age,TRS_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_trs_rid)/length(test_error_trs_rid)),4)),
+paste("VEcv=",round(1-sum(test_error_trs_rid^2/(var(Test_TRS_dat$Age)*(length(Test_TRS_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - FESSD
+SSD_pred_age <- predict(ridge.fit, newx = as.matrix(Test_FESSD_dat[,5:81]))
+test_error_ssd_rid <- SSD_pred_age-Test_FESSD_dat$Age
+
+plot(SSD_pred_age,Test_FESSD_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (FE-SSD)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_FESSD_dat$Age,SSD_pred_age),4)),
+                          paste("R2=",round(cor(Test_FESSD_dat$Age,SSD_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_ssd_rid)/length(test_error_ssd_rid)),4)),
+paste("VEcv=",round(1-sum(test_error_ssd_rid^2/(var(Test_FESSD_dat$Age)*(length(Test_FESSD_dat$Age)-1))),4)*100,"%")),bty="n")
+   
+
+#### MAE by age group
+
+ 
+mae=NULL
+mae_ridge <- NULL
+
+var <- list(Train_HC_data,Test_HC_data,Test_schizophrenia_dat,Test_FESSD_dat,Test_TRS_dat)
+
+for (j in 1:length(var)){
+  newx <- data.frame(var[j])
+  ctrl_pred_age <- predict(ridge.fit, newx = as.matrix(newx[,5:81]))
+  age_catg <- newx %>% dplyr::select(SubjID, Age)
+  age_catg$age_catg <- ifelse(age_catg$Age<30,1,
+                              ifelse(age_catg$Age>=30 & age_catg$Age<40,2,
+                                     ifelse(age_catg$Age>=40 & age_catg$Age<50,3,4)))
+  age_catg$error <- ctrl_pred_age-age_catg$Age
+  for (i in 1:4){
+    dat <- age_catg %>% dplyr::filter(age_catg==i)
+    res <- round(sum(abs(dat$error)/length(dat$error)),4)
+    mae <- rbind(mae,cbind(length(dat$error),res))
+  }
+  mae_ridge <- cbind(mae_ridge,mae)
+  mae=NULL
+}
+mae_ridge
+ 
+
+
+
+#### Brain PAD correction-plot
+ 
+#### Brain PAD correction-HC
+pred_age <- predict(ridge.fit,newx=as.matrix(Test_HC_data[,5:81]))
+test_error_rid <- pred_age-Test_HC_data$Age
+PAD_rid <- test_error_rid
+cor.test(PAD_rid,Test_HC_data$Age)$p.value
+
+png("1_rigde_corr.png", width = 800, height = 600)
+par(mfrow=c(2,2), oma=c(1,3,1,1))
+
+plot(Test_HC_data$Age,PAD_rid,xlim=c(10,80),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test HC)",ylab="Brain PAD uncorrected")
+abline(h=0,lty=2,col="red")
+abline(lm(PAD_rid~Test_HC_data$Age))
+legend("topright",legend=paste("r=",round(cor(PAD_rid,Test_HC_data$Age),4),"(p<0.05)",sep=""))
+mtext("A", side=3, line=-3, cex=2, adj = -0.0, outer=TRUE)
+
+
+Model_linear <- lm(PAD_rid~Test_HC_data$Age+Test_HC_data$Sex)
+NullModel <- lm(PAD_rid~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+Test_HC_data$Age2 <- Test_HC_data$Age^2
+
+Model_quad <- lm(PAD_rid~Test_HC_data$Sex+Test_HC_data$Age+Test_HC_data$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Not Reject H0 (Reduced model is better)
+
+cPAD_rid <- lm(PAD_rid~+Test_HC_data$Sex+Test_HC_data$Age)$residuals
+
+plot(Test_HC_data$Age,cPAD_rid,xlim=c(10,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test HC)",ylab="Brain PAD corrected for age")
+abline(lm(cPAD_rid~Test_HC_data$Age))
+abline(h=0,lty=2,col="red")
+mtext("B", side=3, line=-3, cex=2, adj = 0.5, outer=TRUE)
+
+
+#### Brain PAD correction-Patient
+pred_age <- predict(ridge.fit,newx=as.matrix(Test_Patient_dat[,5:81]))
+test_error_rid <- pred_age-Test_Patient_dat$Age
+PAD_rid <- test_error_rid
+
+plot(Test_Patient_dat$Age,PAD_rid,xlim=c(10,80),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test Patient)",ylab="Brain PAD uncorrected")
+abline(h=0,lty=2,col="red")
+abline(lm(PAD_rid~Test_Patient_dat$Age))
+legend("topright",legend=paste("r=",round(cor(PAD_rid,Test_Patient_dat$Age),4),"(p<0.05)",sep=""))
+cor.test(PAD_rid,Test_Patient_dat$Age)$p.value
+mtext("C", side=3, line=-27, cex=2, adj = -0.0, outer=TRUE)
+
+
+Model_linear <- lm(PAD_rid~Test_Patient_dat$Age+Test_Patient_dat$Sex)
+NullModel <- lm(PAD_rid~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+Test_Patient_dat$Age2 <- Test_Patient_dat$Age^2
+
+Model_quad <- lm(PAD_rid~Test_Patient_dat$Sex+Test_Patient_dat$Age+Test_Patient_dat$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+anova(Model_linear,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+cPAD_rid <- lm(PAD_rid~+Test_Patient_dat$Sex+Test_Patient_dat$Age+Test_Patient_dat$Age2)$residuals
+
+plot(Test_Patient_dat$Age,cPAD_rid,xlim=c(10,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test Patient)",ylab="Brain PAD corrected for age")
+abline(lm(cPAD_rid~Test_Patient_dat$Age))
+abline(h=0,lty=2,col="red")
+mtext("D", side=3, line=-27, cex=2, adj = 0.5, outer=TRUE)
+
+dev.off()
+ 
+
+#### Brain PAD correction -table
+ 
+test_dat <- rbind(Test_HC_data,Test_Patient_dat)
+test_dat$Dx <- c(rep(0,nrow(Test_HC_data)),rep(1,nrow(Test_Patient_dat)))
+test_dat$Dx <- factor(test_dat$Dx)
+
+pred_age <- predict(ridge.fit,newx=as.matrix(test_dat[,5:81]))
+test_error_rid <- pred_age-test_dat$Age
+PAD_rid <- test_error_rid
+mean(PAD_rid) ; sd(PAD_rid) ; median(PAD_rid)
+# [1] 2.029919
+# [1] 10.30311
+# [1] 2.275126
+
+Model_linear <- lm(PAD_rid~test_dat$Age+test_dat$Sex)
+NullModel <- lm(PAD_rid~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+test_dat$Age2 <- test_dat$Age^2
+
+Model_quad <- lm(PAD_rid~test_dat$Sex+test_dat$Age+test_dat$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Reject H0 
+
+cPAD_rid <- lm(PAD_rid~+test_dat$Sex+test_dat$Age+test_dat$Age2)$residuals
+mean(cPAD_rid) ; sd(cPAD_rid) ; median(cPAD_rid)
+# [1] -5.199669e-17
+# [1] 9.123928
+# [1] 0.008692962
+
+library(plotrix)
+dat <- data.frame(SubjID=test_dat$SubjID,Brain_PAD = c(PAD_rid),Status=rep(c("Control","Patient"),c(nrow(Test_HC_data),nrow(Test_Patient_dat))))
+
+dat$status_sch <- dat$status_trs <- dat$status_ssd <- rep(NA,nrow(dat))
+dat$status_sch[test_dat$SubjID %in% Test_HC_data$SubjID ] <- "Control"   
+dat$status_sch[test_dat$SubjID %in% Test_schizophrenia_dat$SubjID ] <- "Schizophrenia"
+dat$status_trs[test_dat$SubjID %in% Test_TRS_dat$SubjID ] <- "TRS"
+dat$status_trs[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat$status_ssd[test_dat$SubjID %in% Test_FESSD_dat$SubjID ] <- "FE-SSD"
+dat$status_ssd[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+library(dplyr)
+palette <- c("FE-SSD"="darkgreen","TRS"="red","Control"="grey","Schizophrenia"="blue","Patient"="orange")
+
+dat %>% dplyr::select(Brain_PAD,Status) %>% group_by(Status) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_sch) %>% group_by(status_sch) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_trs) %>% group_by(status_trs) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_ssd) %>% group_by(status_ssd) %>% summarise_each(funs(mean,sd,std.error))
+
+library(ggplot2)
+# ggplot(dat,aes(x = Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette) +
+#   coord_cartesian(xlim =c(-30,30)) + theme_bw()  + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_sch),],aes(x = Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_ssd),],aes(x = Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_trs),],aes(x = Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+
+summary(lm(Brain_PAD~Status+test_dat$Sex+test_dat$Age+test_dat$Age2,data=dat))
+summary(lm(Brain_PAD~status_sch+test_dat$Sex+test_dat$Age+test_dat$Age2,data=dat))
+
+
+dat_for_regression <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:214)
+dat[replicated,]
+
+dat_for_regression <- rbind(dat_for_regression,dat[replicated,])
+dat_for_regression[replicated,]$status_ssd <- NA
+dat_for_regression[(nrow(dat_for_regression)-1):nrow(dat_for_regression),]$status_trs <- NA
+
+table(dat_for_regression$status_trs)
+table(dat_for_regression$status_ssd)
+table(dat_for_regression$status_sch)
+
+test_dat_for_regression <- test_dat
+test_dat_for_regression <- rbind(test_dat_for_regression,test_dat[replicated,])
+
+dat_for_regression$status_ssd[is.na(dat_for_regression$status_ssd)] = dat_for_regression$status_trs[is.na(dat_for_regression$status_ssd)]
+
+summary(lm(Brain_PAD~dat_for_regression$status_ssd+test_dat_for_regression$Sex+
+             test_dat_for_regression$Age+
+             test_dat_for_regression$Age2,data=dat_for_regression))
+
+
+# ANOVA results (Control vs FE-SSD vs TRS)
+summary(res_aov <- aov(dat_for_regression$Brain_PAD ~ dat_for_regression$status_ssd))
+pairwise.t.test(dat_for_regression$Brain_PAD,dat_for_regression$status_ssd, p.adj = "fdr")$p.value
+pairwise.t.test(dat_for_regression$Brain_PAD,dat_for_regression$status_ssd, p.adj = "bonferroni")$p.value
+
+# t.test results (Control vs Schizo)
+t.test(dat$Brain_PAD~dat$status_sch)
+t.test(dat$Brain_PAD~dat$status_sch, var.equal=T)
+
+
+#### corrected_Brain_PAD ####
+dat <- data.frame(SubjID=test_dat$SubjID,corrected_Brain_PAD = c(cPAD_rid),Status=rep(c("Control","Patient"),c(nrow(Test_HC_data),nrow(Test_Patient_dat))))
+
+dat$status_sch <- dat$status_trs <- dat$status_ssd <- rep(NA,nrow(dat))
+dat$status_sch[test_dat$SubjID %in% Test_HC_data$SubjID ] <- "Control"   
+dat$status_sch[test_dat$SubjID %in% Test_schizophrenia_dat$SubjID ] <- "Schizophrenia"
+dat$status_trs[test_dat$SubjID %in% Test_TRS_dat$SubjID ] <- "TRS"
+dat$status_trs[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat$status_ssd[test_dat$SubjID %in% Test_FESSD_dat$SubjID ] <- "FE-SSD"
+dat$status_ssd[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat %>% dplyr::select(corrected_Brain_PAD,Status) %>% group_by(Status) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_sch) %>% group_by(status_sch) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_trs) %>% group_by(status_trs) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_ssd) %>% group_by(status_ssd) %>% summarise_each(funs(mean,sd,std.error))
+
+library(ggplot2)
+ggplot(dat,aes(x = corrected_Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette[c(3,5)]) +
+  coord_cartesian(xlim =c(-30,30)) + theme_bw()
+
+A <- ggplot(dat[!is.na(dat$status_sch),],aes(x = corrected_Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette[c(3,4)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+B <- ggplot(dat[!is.na(dat$status_ssd),],aes(x = corrected_Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette[c(3,1)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+C <- ggplot(dat[!is.na(dat$status_trs),],aes(x = corrected_Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette[c(3,2)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+library(ggpubr)
+png("S5-2(ridge).png", width = 1400, height = 300)
+ggarrange(A,B,C,
+          labels = c("A","B","C"), 
+          ncol = 3, nrow = 1,
+          font.label = list(size=20))
+dev.off()
+
+
+# ANOVA results (Control vs FE-SSD vs TRS)
+dat_for_regression <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:214)
+dat[replicated,]
+
+dat_for_regression <- rbind(dat_for_regression,dat[replicated,])
+dat_for_regression[replicated,]$status_ssd <- NA
+dat_for_regression[(nrow(dat_for_regression)-1):nrow(dat_for_regression),]$status_trs <- NA
+
+table(dat_for_regression$status_trs)
+table(dat_for_regression$status_ssd)
+
+test_dat_for_regression <- test_dat
+test_dat_for_regression <- rbind(test_dat_for_regression,test_dat[replicated,])
+
+dat_for_regression$status_ssd[is.na(dat_for_regression$status_ssd)] = dat_for_regression$status_trs[is.na(dat_for_regression$status_ssd)]
+
+summary(res_aov <- aov(dat_for_regression$corrected_Brain_PAD~
+                         dat_for_regression$status_ssd))
+
+pairwise.t.test(dat_for_regression$corrected_Brain_PAD,
+               dat_for_regression$status_ssd, p.adj = "fdr")$p.value
+
+pairwise.t.test(dat_for_regression$corrected_Brain_PAD,
+               dat_for_regression$status_ssd, p.adj = "bonferroni")$p.value
+
+# t.test results (Control vs Schizo)
+t.test(dat$corrected_Brain_PAD~dat$status_sch)
+t.test(dat$corrected_Brain_PAD~dat$status_sch, var.equal=T)
+summary(res_aov <- aov(dat$corrected_Brain_PAD~dat$status_sch))
+ 
+
+
+ 
+
+### SVR[RBF] (Nested CV)
+
+   
+library(kernlab)
+start.time <- Sys.time()
+
+Nfolds <- 10
+
+svm.fun <- function(N,i){
+  Nfolds <- N
+  set.seed(i)
+  outer_folds <- createFolds(Train_HC_data$Age,k=Nfolds)
+  cv.svm <- lapply(outer_folds,function(index) {
+    tr <- Train_HC_data[-outer_folds$Fold01,]
+    ts <- Train_HC_data[outer_folds$Fold01,]
+    svm.fit <- ksvm(as.matrix(tr[, c(5:81)]),
+               tr[,2],
+               kpar="automatic",
+               kernel="rbfdot",cross=Nfolds) 
+    
+    c(svm.fit@cross,svm.fit@kernelf@kpar[["sigma"]])
+    })
+}
+
+Ntimes <- 10
+RES <- NULL
+for(i in 1:Ntimes){
+  res <- mclapply(10,i,FUN=svm.fun,mc.cores = 6)
+  RES <- rbind(RES,t(data.frame(res)))
+}
+ 
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+svm.fit.77 <- ksvm(as.matrix(Train_HC_data[,c(5:81)]),Train_HC_data[,2],
+                  kpar=list(sigma=RES[,2][which.min(RES[,1])]),
+                  kernel="rbfdot")
+svm.fit.77
+
+
+# JBUH Control
+
+ctrl_pred_age <- predict(svm.fit.77 ,as.matrix(JBUH_HC_data[,5:81]))
+train_error_ctrl_svm <- ctrl_pred_age-JBUH_HC_data$Age
+
+par(mfrow=c(1,1))
+plot(ctrl_pred_age,JBUH_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (JBUH control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(JBUH_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(JBUH_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(train_error_ctrl_svm)/length(train_error_ctrl_svm)),4)),
+                paste("VEcv=",round(1-sum(train_error_ctrl_svm^2/(var(JBUH_HC_data$Age)*(length(JBUH_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+
+
+# Train Control
+
+ctrl_pred_age <- predict(svm.fit.77 ,as.matrix(Train_HC_data[,5:81]))
+train_error_ctrl_svm <- ctrl_pred_age-Train_HC_data$Age
+
+par(mfrow=c(1,1))
+plot(ctrl_pred_age,Train_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Train control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(Train_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(Train_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(train_error_ctrl_svm)/length(train_error_ctrl_svm)),4)),
+                paste("VEcv=",round(1-sum(train_error_ctrl_svm^2/(var(Train_HC_data$Age)*(length(Train_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+
+# Test Control
+
+ctrl_pred_age <- predict(svm.fit.77 , as.matrix(Test_HC_data[,5:81]))
+test_error_ctrl_svm <- ctrl_pred_age-Test_HC_data$Age
+
+plot(ctrl_pred_age,Test_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Test control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(Test_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(Test_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(test_error_ctrl_svm)/length(test_error_ctrl_svm)),4)),
+                paste("VEcv=",round(1-sum(test_error_ctrl_svm^2/(var(Test_HC_data$Age)*(length(Test_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+# Patient
+pat_pred_age <- predict(svm.fit.77 ,as.matrix(Test_Patient_dat[,5:81]))
+test_error_pat_svm <- pat_pred_age-Test_Patient_dat$Age
+
+plot(pat_pred_age,Test_Patient_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Patient)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_Patient_dat$Age,pat_pred_age),4)),paste("R2=",round(cor(Test_Patient_dat$Age,pat_pred_age)^2,4)),                   paste("MAE=",round(sum(abs(test_error_pat_svm)/length(test_error_pat_svm)),4)),
+                          paste("VEcv=",round(1-sum(test_error_pat_svm^2/(var(Test_Patient_dat$Age)*(length(Test_Patient_dat$Age)-1))),4)*100,"%")),bty="n")
+
+
+# Patient - schizo
+sch_pred_age <- predict(svm.fit.77, as.matrix(Test_schizophrenia_dat[,5:81]))
+test_error_sch_svm <- sch_pred_age-Test_schizophrenia_dat$Age
+
+plot(sch_pred_age,Test_schizophrenia_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Schizophrenia)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_schizophrenia_dat$Age,sch_pred_age),4)),
+                          paste("R2=",round(cor(Test_schizophrenia_dat$Age,sch_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_sch_svm)/length(test_error_sch_svm)),4)),
+paste("VEcv=",round(1-sum(test_error_sch_svm^2/(var(Test_schizophrenia_dat$Age)*(length(Test_schizophrenia_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - TRS
+TRS_pred_age <- predict(svm.fit.77, as.matrix(Test_TRS_dat[,5:81]))
+test_error_trs_svm <- TRS_pred_age-Test_TRS_dat$Age
+
+plot(TRS_pred_age,Test_TRS_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (TRS)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_TRS_dat$Age,TRS_pred_age),4)),
+                          paste("R2=",round(cor(Test_TRS_dat$Age,TRS_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_trs_svm)/length(test_error_trs_svm)),4)),
+paste("VEcv=",round(1-sum(test_error_trs_svm^2/(var(Test_TRS_dat$Age)*(length(Test_TRS_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - FESSD
+SSD_pred_age <- predict(svm.fit.77, as.matrix(Test_FESSD_dat[,5:81]))
+test_error_ssd_svm <- SSD_pred_age-Test_FESSD_dat$Age
+
+plot(SSD_pred_age,Test_FESSD_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (FE-SSD)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_FESSD_dat$Age,SSD_pred_age),4)),
+                          paste("R2=",round(cor(Test_FESSD_dat$Age,SSD_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_ssd_svm)/length(test_error_ssd_svm)),4)),
+paste("VEcv=",round(1-sum(test_error_ssd_svm^2/(var(Test_FESSD_dat$Age)*(length(Test_FESSD_dat$Age)-1))),4)*100,"%")),bty="n")
+   
+
+
+#### MAE by age group
+
+ 
+mae=NULL
+mae_svr <- NULL
+
+var <- list(Train_HC_data,Test_HC_data,Test_schizophrenia_dat,Test_FESSD_dat,Test_TRS_dat)
+
+for (j in 1:length(var)){
+  newx <- data.frame(var[j])
+  ctrl_pred_age <- predict(svm.fit.77, as.matrix(newx[,5:81]))
+  age_catg <- newx %>% dplyr::select(SubjID, Age)
+  age_catg$age_catg <- ifelse(age_catg$Age<30,1,
+                              ifelse(age_catg$Age>=30 & age_catg$Age<40,2,
+                                     ifelse(age_catg$Age>=40 & age_catg$Age<50,3,4)))
+  age_catg$error <- ctrl_pred_age-age_catg$Age
+  for (i in 1:4){
+    dat <- age_catg %>% dplyr::filter(age_catg==i)
+    res <- round(sum(abs(dat$error)/length(dat$error)),4)
+    mae <- rbind(mae,cbind(length(dat$error),res))
+  }
+  mae_svr <- cbind(mae_svr,mae)
+  mae=NULL
+}
+mae_svr
+ 
+
+
+
+#### Brain PAD correction-plot
+
+ 
+#### Brain PAD correction-HC
+pred_age <- predict(svm.fit.77, as.matrix(Test_HC_data[,5:81]))
+test_error_svm <- pred_age-Test_HC_data$Age
+PAD_svm <- test_error_svm
+
+png("2_SVR_corr.png", width = 800, height = 600)
+par(mfrow=c(2,2), oma=c(1,3,1,1))
+
+plot(Test_HC_data$Age,PAD_svm,xlim=c(10,80),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test HC)",ylab="Brain PAD uncorrected")
+abline(h=0,lty=2,col="red")
+abline(lm(PAD_svm~Test_HC_data$Age))
+legend("topright",legend=paste("r=",round(cor(PAD_svm,Test_HC_data$Age),4),"(p<0.05)",sep=""))
+cor.test(PAD_svm,Test_HC_data$Age)$p.value
+mtext("A", side=3, line=-3, cex=2, adj = -0.0, outer=TRUE)
+
+
+Model_linear <- lm(PAD_svm~Test_HC_data$Age+Test_HC_data$Sex)
+NullModel <- lm(PAD_svm~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+Test_HC_data$Age2 <- Test_HC_data$Age^2
+Model_quad <- lm(PAD_svm~+Test_HC_data$Sex+Test_HC_data$Age+Test_HC_data$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Not Reject H0 (Reduced model is better)
+
+cPAD_svm <- lm(PAD_svm~+Test_HC_data$Sex+Test_HC_data$Age)$residuals
+
+
+plot(Test_HC_data$Age,cPAD_svm,xlim=c(10,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test HC)",ylab="Brain PAD corrected for age")
+abline(lm(cPAD_svm~Test_HC_data$Age))
+abline(h=0,lty=2,col="red")
+mtext("B", side=3, line=-3, cex=2, adj = 0.5, outer=TRUE)
+
+
+#### Brain PAD correction-Patient
+pred_age <- predict(svm.fit.77, as.matrix(Test_Patient_dat[,5:81]))
+test_error_svm <- pred_age-Test_Patient_dat$Age
+PAD_svm <- test_error_svm
+
+
+plot(Test_Patient_dat$Age,PAD_svm,xlim=c(10,80),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test Patient)",ylab="Brain PAD uncorrected")
+abline(h=0,lty=2,col="red")
+abline(lm(PAD_svm~Test_Patient_dat$Age))
+legend("topright",legend=paste("r=",round(cor(PAD_svm,Test_Patient_dat$Age),4),"(p<0.05)",sep=""))
+cor.test(PAD_svm,Test_Patient_dat$Age)$p.value
+mtext("C", side=3, line=-27, cex=2, adj = -0.0, outer=TRUE)
+
+Model_linear <- lm(PAD_svm~Test_Patient_dat$Age+Test_Patient_dat$Sex)
+NullModel <- lm(PAD_svm~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+Test_Patient_dat$Age2 <- Test_Patient_dat$Age^2
+Model_quad <- lm(PAD_svm~+Test_Patient_dat$Sex+Test_Patient_dat$Age+Test_Patient_dat$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+cPAD_svm <- lm(PAD_svm~+Test_Patient_dat$Sex+Test_Patient_dat$Age+Test_Patient_dat$Age2)$residuals
+
+plot(Test_Patient_dat$Age,cPAD_svm,xlim=c(10,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test Patienit)",ylab="Brain PAD corrected for age")
+abline(lm(cPAD_svm~Test_Patient_dat$Age+Test_Patient_dat$Age2))
+abline(h=0,lty=2,col="red")
+mtext("D", side=3, line=-27, cex=2, adj = 0.5, outer=TRUE)
+
+dev.off()
+ 
+
+#### Brain PAD correction -table
+
+ 
+test_dat <- rbind(Test_HC_data,Test_Patient_dat)
+test_dat$Dx <- c(rep(0,nrow(Test_HC_data)),rep(1,nrow(Test_Patient_dat)))
+test_dat$Dx <- factor(test_dat$Dx)
+
+pred_age <- predict(svm.fit.77 , as.matrix(test_dat[,5:81]))
+test_error_svm <- pred_age-test_dat$Age
+PAD_svm <- test_error_svm
+mean(PAD_svm) ; sd(PAD_svm) ; median(PAD_svm)
+
+
+Model_linear <- lm(PAD_svm~test_dat$Age+test_dat$Sex)
+NullModel <- lm(PAD_svm~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+test_dat$Age2 <- test_dat$Age^2
+Model_quad <- lm(PAD_svm~+test_dat$Sex+test_dat$Age+test_dat$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Not Reject H0 (Reduced model is better)
+
+cPAD_svm <- lm(PAD_svm~+test_dat$Sex+test_dat$Age+test_dat$Age2)$residuals
+mean(cPAD_svm) ; sd(cPAD_svm) ; median(cPAD_svm)
+
+
+library(plotrix)
+dat <- data.frame(SubjID=test_dat$SubjID,Brain_PAD = c(PAD_svm),Status=rep(c("Control","Patient"),c(nrow(Test_HC_data),nrow(Test_Patient_dat))))
+
+dat$status_sch <- dat$status_trs <- dat$status_ssd <- rep(NA,nrow(dat))
+dat$status_sch[test_dat$SubjID %in% Test_HC_data$SubjID ] <- "Control"   
+dat$status_sch[test_dat$SubjID %in% Test_schizophrenia_dat$SubjID ] <- "Schizophrenia"
+dat$status_trs[test_dat$SubjID %in% Test_TRS_dat$SubjID ] <- "TRS"
+dat$status_trs[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat$status_ssd[test_dat$SubjID %in% Test_FESSD_dat$SubjID ] <- "FE-SSD"
+dat$status_ssd[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+library(dplyr)
+palette <- c("FE-SSD"="darkgreen","TRS"="red","Control"="grey","Schizophrenia"="blue","Patient"="orange")
+
+dat %>% dplyr::select(Brain_PAD,Status) %>% group_by(Status) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_sch) %>% group_by(status_sch) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_trs) %>% group_by(status_trs) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_ssd) %>% group_by(status_ssd) %>% summarise_each(funs(mean,sd,std.error))
+
+ggplot(dat,aes(x = Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette) +
+  coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_sch),],aes(x = Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_ssd),],aes(x = Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_trs),],aes(x = Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+summary(lm(Brain_PAD~Status+test_dat$Sex+test_dat$Age+test_dat$Age2,data=dat))
+summary(lm(Brain_PAD~status_sch+test_dat$Sex+test_dat$Age+test_dat$Age2,data=dat))
+
+
+dat_for_regression <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:214)
+dat[replicated,]
+
+dat_for_regression <- rbind(dat_for_regression,dat[replicated,])
+dat_for_regression[replicated,]$status_ssd <- NA
+dat_for_regression[(nrow(dat_for_regression)-1):nrow(dat_for_regression),]$status_trs <- NA
+
+table(dat_for_regression$status_trs)
+table(dat_for_regression$status_ssd)
+
+test_dat_for_regression <- test_dat
+test_dat_for_regression <- rbind(test_dat_for_regression,test_dat[replicated,])
+
+dat_for_regression$status_ssd[is.na(dat_for_regression$status_ssd)] = dat_for_regression$status_trs[is.na(dat_for_regression$status_ssd)]
+
+summary(lm(Brain_PAD~dat_for_regression$status_ssd+test_dat_for_regression$Sex+
+             test_dat_for_regression$Age+
+             test_dat_for_regression$Age2,data=dat_for_regression))
+
+
+
+# ANOVA results (Control vs FE-SSD vs TRS)
+summary(res_aov <- aov(dat_for_regression$Brain_PAD ~ dat_for_regression$status_ssd))
+pairwise.t.test(dat_for_regression$Brain_PAD,dat_for_regression$status_ssd, p.adj = "fdr")$p.value
+pairwise.t.test(dat_for_regression$Brain_PAD,dat_for_regression$status_ssd, p.adj = "bonferroni")$p.value
+
+# t.test results (Control vs Schizo)
+t.test(dat$Brain_PAD~dat$status_sch)
+t.test(dat$Brain_PAD~dat$status_sch, var.equal=T)
+
+
+#### corrected_Brain_PAD ####
+
+dat <- data.frame(SubjID=test_dat$SubjID,corrected_Brain_PAD = c(cPAD_svm),Status=rep(c("Control","Patient"),c(nrow(Test_HC_data),nrow(Test_Patient_dat))))
+
+dat$status_sch <- dat$status_trs <- dat$status_ssd <- rep(NA,nrow(dat))
+dat$status_sch[test_dat$SubjID %in% Test_HC_data$SubjID ] <- "Control"   
+dat$status_sch[test_dat$SubjID %in% Test_schizophrenia_dat$SubjID ] <- "Schizophrenia"
+dat$status_trs[test_dat$SubjID %in% Test_TRS_dat$SubjID ] <- "TRS"
+dat$status_trs[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat$status_ssd[test_dat$SubjID %in% Test_FESSD_dat$SubjID ] <- "FE-SSD"
+dat$status_ssd[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat %>% dplyr::select(corrected_Brain_PAD,Status) %>% group_by(Status) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_sch) %>% group_by(status_sch) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_trs) %>% group_by(status_trs) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_ssd) %>% group_by(status_ssd) %>% summarise_each(funs(mean,sd,std.error))
+
+ggplot(dat,aes(x = corrected_Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette) +
+  coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_sch),],aes(x = corrected_Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_ssd),],aes(x = corrected_Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_trs),],aes(x = corrected_Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+
+
+
+
+
+
+
+library(ggplot2)
+ggplot(dat,aes(x = corrected_Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette[c(3,5)]) +
+  coord_cartesian(xlim =c(-30,30)) + theme_bw()
+
+A <- ggplot(dat[!is.na(dat$status_sch),],aes(x = corrected_Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette[c(3,4)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+B <- ggplot(dat[!is.na(dat$status_ssd),],aes(x = corrected_Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette[c(3,1)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+C <- ggplot(dat[!is.na(dat$status_trs),],aes(x = corrected_Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette[c(3,2)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+library(ggpubr)
+png("p2(SVR).png", width = 1400, height = 300)
+ggarrange(A,B,C,
+          labels = c("A","B","C"), 
+          ncol = 3, nrow = 1,
+          font.label = list(size=20))
+dev.off()
+
+
+
+
+
+
+
+
+dat_for_regression <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:214)
+dat[replicated,]
+
+dat_for_regression <- rbind(dat_for_regression,dat[replicated,])
+dat_for_regression[replicated,]$status_ssd <- NA
+dat_for_regression[(nrow(dat_for_regression)-1):nrow(dat_for_regression),]$status_trs <- NA
+
+table(dat_for_regression$status_trs)
+table(dat_for_regression$status_ssd)
+
+test_dat_for_regression <- test_dat
+test_dat_for_regression <- rbind(test_dat_for_regression,test_dat[replicated,])
+
+dat_for_regression$status_ssd[is.na(dat_for_regression$status_ssd)] = dat_for_regression$status_trs[is.na(dat_for_regression$status_ssd)]
+
+summary(res_aov <- aov(dat_for_regression$corrected_Brain_PAD~
+                         dat_for_regression$status_ssd))
+
+pairwise.t.test(dat_for_regression$corrected_Brain_PAD,
+               dat_for_regression$status_ssd, p.adj = "fdr")$p.value
+
+pairwise.t.test(dat_for_regression$corrected_Brain_PAD,
+               dat_for_regression$status_ssd, p.adj = "bonferroni")$p.value
+
+# t.test results (Control vs Schizo)
+t.test(dat$corrected_Brain_PAD~dat$status_sch)
+t.test(dat$corrected_Brain_PAD~dat$status_sch, var.equal=T)
+summary(res_aov <- aov(dat$corrected_Brain_PAD~dat$status_sch))
+ 
+
+
+ 
+
+### RVR[RBF] (Nested CV)
+
+ 
+
+   
+start.time <- Sys.time()
+
+Nfolds <- 10
+
+rvm.fun <- function(N,i){
+  Nfolds <- N
+  set.seed(i)
+  outer_folds <- createFolds(Train_HC_data$Age,k=Nfolds)
+  cv.rvm <- lapply(outer_folds,function(index) {
+    tr <- Train_HC_data[-index,]
+    ts <- Train_HC_data[index,]
+    rvm.fit <- rvm(as.matrix(tr[, c(5:81)]),
+               tr[,2],type="regression",
+               kpar="automatic",
+               kernel="rbfdot",cross=Nfolds)
+    
+    c(rvm.fit@cross,rvm.fit@kernelf@kpar[["sigma"]])
+    })
+}
+
+Ntimes <- 10
+RES <- NULL
+for(i in 1:Ntimes){
+  res <- mclapply(10,i,FUN=rvm.fun,mc.cores = 6)
+  RES <- rbind(RES,t(data.frame(res)))
+}
+ 
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+
+rvm.fit.77 <- rvm(as.matrix(Train_HC_data[,c(5:81)]),Train_HC_data[,2],
+                  kpar=list(sigma=RES[,2][which.min(RES[,1])]),
+                  type="regression",kernel="rbfdot")
+rvm.fit.77
+
+
+# Train Control
+ctrl_pred_age <- predict(rvm.fit.77 ,as.matrix(Train_HC_data[,5:81]))
+train_error_ctrl_rvm <- ctrl_pred_age-Train_HC_data$Age
+
+par(mfrow=c(1,1))
+plot(ctrl_pred_age,Train_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Train control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(Train_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(Train_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(train_error_ctrl_rvm)/length(train_error_ctrl_rvm)),4)),
+                paste("VEcv=",round(1-sum(train_error_ctrl_rvm^2/(var(Train_HC_data$Age)*(length(Train_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+# Test Control
+
+ctrl_pred_age <- predict(rvm.fit.77 , as.matrix(Test_HC_data[,5:81]))
+test_error_ctrl_rvm <- ctrl_pred_age-Test_HC_data$Age
+
+plot(ctrl_pred_age,Test_HC_data$Age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Test control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(Test_HC_data$Age,ctrl_pred_age),4)),
+                paste("R2=",round(cor(Test_HC_data$Age,ctrl_pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(test_error_ctrl_rvm)/length(test_error_ctrl_rvm)),4)),
+                paste("VEcv=",round(1-sum(test_error_ctrl_rvm^2/(var(Test_HC_data$Age)*(length(Test_HC_data$Age)-1))),4)*100,"%")) ,bty="n")
+
+
+# Patient
+
+pat_pred_age <- predict(rvm.fit.77 ,as.matrix(Test_Patient_dat[,5:81]))
+test_error_pat_rvm <- pat_pred_age-Test_Patient_dat$Age
+
+plot(pat_pred_age,Test_Patient_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Patient)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_Patient_dat$Age,pat_pred_age),4)),paste("R2=",round(cor(Test_Patient_dat$Age,pat_pred_age)^2,4)),
+                          paste("MAE=",round(sum(abs(test_error_pat_rid)/length(test_error_pat_rid)),4)),
+                          paste("VEcv=",round(1-sum(test_error_pat_rid^2/(var(Test_Patient_dat$Age)*(length(Test_Patient_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - schizo
+sch_pred_age <- predict(rvm.fit.77, as.matrix(Test_schizophrenia_dat[,5:81]))
+test_error_sch_rvm <- sch_pred_age-Test_schizophrenia_dat$Age
+
+plot(sch_pred_age,Test_schizophrenia_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Schizophrenia)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_schizophrenia_dat$Age,sch_pred_age),4)),
+                          paste("R2=",round(cor(Test_schizophrenia_dat$Age,sch_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_sch_rvm)/length(test_error_sch_rvm)),4)),
+paste("VEcv=",round(1-sum(test_error_sch_rvm^2/(var(Test_schizophrenia_dat$Age)*(length(Test_schizophrenia_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - TRS
+TRS_pred_age <- predict(rvm.fit.77, as.matrix(Test_TRS_dat[,5:81]))
+test_error_trs_rvm <- TRS_pred_age-Test_TRS_dat$Age
+
+plot(TRS_pred_age,Test_TRS_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (TRS)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_TRS_dat$Age,TRS_pred_age),4)),
+                          paste("R2=",round(cor(Test_TRS_dat$Age,TRS_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_trs_rvm)/length(test_error_trs_rvm)),4)),
+paste("VEcv=",round(1-sum(test_error_trs_rvm^2/(var(Test_TRS_dat$Age)*(length(Test_TRS_dat$Age)-1))),4)*100,"%")),bty="n")
+
+# Patient - FESSD
+SSD_pred_age <- predict(rvm.fit.77, as.matrix(Test_FESSD_dat[,5:81]))
+test_error_ssd_rvm <- SSD_pred_age-Test_FESSD_dat$Age
+
+plot(SSD_pred_age,Test_FESSD_dat$Age,xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (FE-SSD)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",legend=c(paste("r=",round(cor(Test_FESSD_dat$Age,SSD_pred_age),4)),
+                          paste("R2=",round(cor(Test_FESSD_dat$Age,SSD_pred_age)^2,4)),
+paste("MAE=",round(sum(abs(test_error_ssd_rvm)/length(test_error_ssd_rvm)),4)),
+paste("VEcv=",round(1-sum(test_error_ssd_rvm^2/(var(Test_FESSD_dat$Age)*(length(Test_FESSD_dat$Age)-1))),4)*100,"%")),bty="n")
+ 
+
+
+
+#### MAE by age group
+
+ 
+mae=NULL
+mae_rvr <- NULL
+
+var <- list(Train_HC_data,Test_HC_data,Test_schizophrenia_dat,Test_FESSD_dat,Test_TRS_dat)
+
+for (j in 1:length(var)){
+  newx <- data.frame(var[j])
+  ctrl_pred_age <- predict(rvm.fit.77, as.matrix(newx[,5:81]))
+  age_catg <- newx %>% dplyr::select(SubjID, Age)
+  age_catg$age_catg <- ifelse(age_catg$Age<30,1,
+                              ifelse(age_catg$Age>=30 & age_catg$Age<40,2,
+                                     ifelse(age_catg$Age>=40 & age_catg$Age<50,3,4)))
+  age_catg$error <- ctrl_pred_age-age_catg$Age
+  for (i in 1:4){
+    dat <- age_catg %>% dplyr::filter(age_catg==i)
+    res <- round(sum(abs(dat$error)/length(dat$error)),4)
+    mae <- rbind(mae,cbind(length(dat$error),res))
+  }
+  mae_rvr <- cbind(mae_rvr,mae)
+  mae=NULL
+}
+mae_rvr
+ 
+
+
+#### Brain PAD correction-plot
+
+ 
+#### Brain PAD correction-HC
+pred_age <- predict(rvm.fit.77 , as.matrix(Test_HC_data[,5:81]))
+test_error_rvm <- pred_age-Test_HC_data$Age
+PAD_rvm <- test_error_rvm
+
+png("3_RVR_corr.png", width = 800, height = 600)
+par(mfrow=c(2,2), oma=c(1,3,1,1))
+
+plot(Test_HC_data$Age,PAD_rvm,xlim=c(10,80),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test HC)",ylab="Brain PAD uncorrected")
+abline(h=0,lty=2,col="red")
+abline(lm(PAD_rvm~Test_HC_data$Age))
+legend("topright",legend=paste("r=",round(cor(PAD_rvm,Test_HC_data$Age),4),"(p<0.05)",sep=""))
+cor.test(PAD_rvm,Test_HC_data$Age)$p.value
+mtext("A", side=3, line=-3, cex=2, adj = -0.0, outer=TRUE)
+
+Model_linear <- lm(PAD_rvm~Test_HC_data$Age+Test_HC_data$Sex)
+NullModel <- lm(PAD_rvm~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+Test_HC_data$Age2 <- Test_HC_data$Age^2
+Model_quad <- lm(PAD_rvm~Test_HC_data$Sex+Test_HC_data$Age+Test_HC_data$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Not Reject H0 (Reduced model is better)
+
+cPAD_rvm <- lm(PAD_rvm~Test_HC_data$Sex+Test_HC_data$Age)$residuals
+
+plot(Test_HC_data$Age,cPAD_rvm,xlim=c(10,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test HC)",ylab="Brain PAD corrected for age")
+abline(lm(cPAD_rvm~Test_HC_data$Age))
+abline(h=0,lty=2,col="red")
+mtext("B", side=3, line=-3, cex=2, adj = 0.5, outer=TRUE)
+
+#### Brain PAD correction-Patient
+pred_age <- predict(rvm.fit.77 , as.matrix(Test_Patient_dat[,5:81]))
+test_error_rvm <- pred_age-Test_Patient_dat$Age
+PAD_rvm <- test_error_rvm
+
+plot(Test_Patient_dat$Age,PAD_rvm,xlim=c(10,80),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test Patient)",ylab="Brain PAD uncorrected")
+abline(h=0,lty=2,col="red")
+abline(lm(PAD_rvm~Test_Patient_dat$Age))
+legend("topright",legend=paste("r=",round(cor(PAD_rvm,Test_Patient_dat$Age),4),"(p<0.05)",sep=""))
+cor.test(PAD_rvm,Test_Patient_dat$Age)$p.value
+mtext("C", side=3, line=-27, cex=2, adj = -0.0, outer=TRUE)
+
+Model_linear <- lm(PAD_rvm~Test_Patient_dat$Age+Test_Patient_dat$Sex)
+NullModel <- lm(PAD_rvm~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+Test_Patient_dat$Age2 <- Test_Patient_dat$Age^2
+Model_quad <- lm(PAD_rvm~Test_Patient_dat$Sex+Test_Patient_dat$Age+Test_Patient_dat$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Not Reject H0 (Reduced model is better)
+
+cPAD_rvm <- lm(PAD_rvm~Test_Patient_dat$Sex+Test_Patient_dat$Age)$residuals
+
+plot(Test_Patient_dat$Age,cPAD_rvm,xlim=c(10,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test Patient)",ylab="Brain PAD corrected for age")
+abline(lm(cPAD_rvm~Test_Patient_dat$Age))
+abline(h=0,lty=2,col="red")
+mtext("D", side=3, line=-27, cex=2, adj = 0.5, outer=TRUE)
+
+dev.off()
+ 
+
+
+#### Brain PAD correction -table
+ 
+##### Brain PAD correction 
+test_dat <- rbind(Test_HC_data,Test_Patient_dat)
+test_dat$Dx <- c(rep(0,nrow(Test_HC_data)),rep(1,nrow(Test_Patient_dat)))
+test_dat$Dx <- factor(test_dat$Dx)
+
+pred_age <- predict(rvm.fit.77 , as.matrix(test_dat[,5:81]))
+test_error_rvm <- pred_age-test_dat$Age
+PAD_rvm <- test_error_rvm
+mean(PAD_rvm) ; sd(PAD_rvm) ; median(PAD_rvm)
+
+
+Model_linear <- lm(PAD_rvm~test_dat$Age+test_dat$Sex)
+NullModel <- lm(PAD_rvm~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+test_dat$Age2 <- test_dat$Age^2
+Model_quad <- lm(PAD_rvm~test_dat$Sex+test_dat$Age+test_dat$Age2)
+anova(NullModel,Model_quad,test="Chisq") # Reject H0 (Full model is better)
+anova(Model_linear,Model_quad,test="Chisq") # Not Reject H0 (Reduced model is better)
+
+cPAD_rvm <- lm(PAD_rvm~test_dat$Sex+test_dat$Age)$residuals
+mean(cPAD_rvm) ; sd(cPAD_rvm) ; median(cPAD_rvm)
+
+
+library(plotrix)
+dat <- data.frame(SubjID=test_dat$SubjID,Brain_PAD = c(PAD_rvm),Status=rep(c("Control","Patient"),c(nrow(Test_HC_data),nrow(Test_Patient_dat))))
+
+dat$status_sch <- dat$status_trs <- dat$status_ssd <- rep(NA,nrow(dat))
+dat$status_sch[test_dat$SubjID %in% Test_HC_data$SubjID ] <- "Control"   
+dat$status_sch[test_dat$SubjID %in% Test_schizophrenia_dat$SubjID ] <- "Schizophrenia"
+dat$status_trs[test_dat$SubjID %in% Test_TRS_dat$SubjID ] <- "TRS"
+dat$status_trs[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat$status_ssd[test_dat$SubjID %in% Test_FESSD_dat$SubjID ] <- "FE-SSD"
+dat$status_ssd[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+library(dplyr)
+palette <- c("FE-SSD"="darkgreen","TRS"="red","Control"="grey","Schizophrenia"="blue","Patient"="orange")
+
+dat %>% dplyr::select(Brain_PAD,Status) %>% group_by(Status) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_sch) %>% group_by(status_sch) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_trs) %>% group_by(status_trs) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(Brain_PAD,status_ssd) %>% group_by(status_ssd) %>% summarise_each(funs(mean,sd,std.error))
+
+ggplot(dat,aes(x = Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette) +
+  coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_sch),],aes(x = Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_ssd),],aes(x = Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_trs),],aes(x = Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+summary(lm(Brain_PAD~Status+test_dat$Sex+test_dat$Age,data=dat))
+summary(lm(Brain_PAD~status_sch+test_dat$Sex+test_dat$Age,data=dat))
+
+dat_for_regression <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:214)
+dat[replicated,]
+ 
+dat_for_regression <- rbind(dat_for_regression,dat[replicated,])
+dat_for_regression[replicated,]$status_ssd <- NA
+dat_for_regression[(nrow(dat_for_regression)-1):nrow(dat_for_regression),]$status_trs <- NA
+
+table(dat_for_regression$status_trs)
+table(dat_for_regression$status_ssd)
+
+test_dat_for_regression <- test_dat
+test_dat_for_regression <- rbind(test_dat_for_regression,test_dat[replicated,])
+
+dat_for_regression$status_ssd[is.na(dat_for_regression$status_ssd)] = dat_for_regression$status_trs[is.na(dat_for_regression$status_ssd)]
+
+summary(lm(Brain_PAD~dat_for_regression$status_ssd+test_dat_for_regression$Sex+
+             test_dat_for_regression$Age,data=dat_for_regression))
+
+
+# ANOVA results (Control vs FE-SSD vs TRS)
+summary(res_aov <- aov(dat_for_regression$Brain_PAD ~ dat_for_regression$status_ssd))
+pairwise.t.test(dat_for_regression$Brain_PAD,dat_for_regression$status_ssd, p.adj = "fdr")$p.value
+pairwise.t.test(dat_for_regression$Brain_PAD,dat_for_regression$status_ssd, p.adj = "bonferroni")$p.value
+
+# t.test results (Control vs Schizo)
+t.test(dat$Brain_PAD~dat$status_sch)
+t.test(dat$Brain_PAD~dat$status_sch, var.equal=T)
+
+
+#### corrected_Brain_PAD ####
+
+dat <- data.frame(SubjID=test_dat$SubjID,corrected_Brain_PAD = c(cPAD_rvm),Status=rep(c("Control","Patient"),c(nrow(Test_HC_data),nrow(Test_Patient_dat))))
+
+dat$status_sch <- dat$status_trs <- dat$status_ssd <- rep(NA,nrow(dat))
+dat$status_sch[test_dat$SubjID %in% Test_HC_data$SubjID ] <- "Control"   
+dat$status_sch[test_dat$SubjID %in% Test_schizophrenia_dat$SubjID ] <- "Schizophrenia"
+dat$status_trs[test_dat$SubjID %in% Test_TRS_dat$SubjID ] <- "TRS"
+dat$status_trs[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat$status_ssd[test_dat$SubjID %in% Test_FESSD_dat$SubjID ] <- "FE-SSD"
+dat$status_ssd[test_dat$SubjID %in% Test_HC_data$SubjID  ] <- "Control"
+
+dat %>% dplyr::select(corrected_Brain_PAD,Status) %>% group_by(Status) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_sch) %>% group_by(status_sch) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_trs) %>% group_by(status_trs) %>% summarise_each(funs(mean,sd,std.error))
+
+dat %>% dplyr::select(corrected_Brain_PAD,status_ssd) %>% group_by(status_ssd) %>% summarise_each(funs(mean,sd,std.error))
+
+ggplot(dat,aes(x = corrected_Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette) +
+  coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_sch),],aes(x = corrected_Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_ssd),],aes(x = corrected_Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+ggplot(dat[!is.na(dat$status_trs),],aes(x = corrected_Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+
+
+
+
+
+library(ggplot2)
+ggplot(dat,aes(x = corrected_Brain_PAD, fill = Status)) + geom_density(alpha = 0.5) + scale_fill_manual(values=palette[c(3,5)]) +
+  coord_cartesian(xlim =c(-30,30)) + theme_bw()
+
+A <- ggplot(dat[!is.na(dat$status_sch),],aes(x = corrected_Brain_PAD, fill = status_sch)) + scale_fill_manual(values=palette[c(3,4)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+B <- ggplot(dat[!is.na(dat$status_ssd),],aes(x = corrected_Brain_PAD, fill = status_ssd)) + scale_fill_manual(values=palette[c(3,1)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+C <- ggplot(dat[!is.na(dat$status_trs),],aes(x = corrected_Brain_PAD, fill = status_trs)) +scale_fill_manual(values=palette[c(3,2)]) + geom_density(alpha = 0.5) + coord_cartesian(xlim =c(-30,30)) + theme_bw() + guides(fill=guide_legend(title=NULL))
+
+library(ggpubr)
+png("S6_2(RVR).png", width = 1400, height = 300)
+ggarrange(A,B,C,
+          labels = c("A","B","C"), 
+          ncol = 3, nrow = 1,
+          font.label = list(size=20))
+dev.off()
+
+
+
+
+
+
+
+
+
+
+
+
+# ANOVA results (Control vs FE-SSD vs TRS)
+dat_for_regression <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:214)
+dat[replicated,]
+
+dat_for_regression <- rbind(dat_for_regression,dat[replicated,])
+dat_for_regression[replicated,]$status_ssd <- NA
+dat_for_regression[(nrow(dat_for_regression)-1):nrow(dat_for_regression),]$status_trs <- NA
+
+table(dat_for_regression$status_trs)
+table(dat_for_regression$status_ssd)
+
+test_dat_for_regression <- test_dat
+test_dat_for_regression <- rbind(test_dat_for_regression,test_dat[replicated,])
+
+dat_for_regression$status_ssd[is.na(dat_for_regression$status_ssd)] = dat_for_regression$status_trs[is.na(dat_for_regression$status_ssd)]
+
+summary(res_aov <- aov(dat_for_regression$corrected_Brain_PAD~
+                         dat_for_regression$status_ssd))
+
+pairwise.t.test(dat_for_regression$corrected_Brain_PAD,
+               dat_for_regression$status_ssd, p.adj = "fdr")$p.value
+
+pairwise.t.test(dat_for_regression$corrected_Brain_PAD,
+               dat_for_regression$status_ssd, p.adj = "bonferroni")$p.value
+
+# t.test results (Control vs Schizo)
+t.test(dat$corrected_Brain_PAD~dat$status_sch)
+t.test(dat$corrected_Brain_PAD~dat$status_sch, var.equal=T)
+summary(res_aov <- aov(dat$corrected_Brain_PAD~dat$status_sch))
+ 
+
+ 
+
+
+
+
+
+
+
+
+
+####################################################################################################
+########################################### SFCN result ############################################
+####################################################################################################
+
+
+setwd("/home/SFCN_Results")
+HC_tr <- read.xlsx("OutFold3_result_agepred_write_outer_HCTrain.xlsx")
+HC_te <- read.xlsx("OutFold3_result_agepred_write_outer_HCTest.xlsx")
+SCZ <- read.xlsx("OutFold3_result_agepred_write_outer_SCZTest.xlsx")
+SSD <- read.xlsx("OutFold3_result_agepred_write_outer_FESSDTest.xlsx")
+TRS <- read.xlsx("OutFold3_result_agepred_write_outer_TRSTest.xlsx")
+
+
+train_error_ctrl_rid <- TRS$Pred_age - TRS$Real_age
+par(mfrow=c(1,1))
+plot(TRS$Pred_age,TRS$Real_age,
+     xlim=c(10,80),ylim=c(10,80),ylab="Chronological age (Train control data)",xlab="Predicted brain age",pch=16)
+abline(0,1)
+legend("topleft",
+       legend=c(paste("r=",round(cor(TRS$Real_age,TRS$Pred_age),4)),
+                paste("R2=",round(cor(TRS$Real_age,TRS$Pred_age)^2,4)),
+                paste("MAE=",round(sum(abs(train_error_ctrl_rid)/length(train_error_ctrl_rid)),4)),
+                paste("VEcv=",round(1-sum(train_error_ctrl_rid^2/(var(TRS$Real_age)*(length(TRS$Real_age)-1))),4)*100,"%")) ,bty="n")
+
+
+
+Patient <- rbind(SCZ,SSD,TRS)
+Patient <- Patient[!duplicated(Patient),]
+
+test_dat <- rbind(HC_te,Patient) #209+233=442
+
+test_error_rid <- test_dat$Pred_age-test_dat$Real_age
+PAD_rid <- test_error_rid
+mean(PAD_rid) ; sd(PAD_rid) ; median(PAD_rid)
+
+table(test_dat$Real_age)
+
+plot(test_dat$Real_age,PAD_rid,xlim=c(15,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test)",ylab="Brain PAD uncorrected")
+abline(h=0,lty=2,col="red")
+abline(lm(PAD_rid~test_dat$Real_age))
+legend("topright",legend=paste("r=",round(cor(PAD_rid,test_dat$Real_age),4),"(p<0.05)"))
+
+Model_linear <- lm(PAD_rid ~ test_dat$Sex + test_dat$Real_age)
+NullModel <- lm(PAD_rid~1)
+anova(NullModel,Model_linear,test="Chisq") # Reject H0 (Full model is better)
+
+test_dat$age2 <- test_dat$Real_age^2
+
+Model_quad <- lm(PAD_rid ~ test_dat$Sex + test_dat$Real_age + test_dat$age2)
+anova(NullModel,Model_quad,test="Chisq") # Not Reject H0 (reduce model is better)
+
+anova(Model_linear,Model_quad,test="Chisq") # Not Reject H0 (reduce model is better)
+
+cPAD_rid <- lm(PAD_rid~+test_dat$Sex+test_dat$Real_age)$residuals
+mean(cPAD_rid) ; sd(cPAD_rid) ; median(cPAD_rid)
+
+plot(test_dat$Real_age,cPAD_rid,xlim=c(10,75),ylim=c(-40,40),pch=16,
+     xlab="Chronological age (Test)",ylab="Brain PAD corrected for age")
+abline(lm(cPAD_rid~test_dat$Real_age))
+
+
+
+dat <- data.frame(ID=test_dat$Data_ID, Brain_PAD = c(PAD_rid), c_Brain_PAD = c(cPAD_rid), 
+                  Status=rep(c("Control","Patient"),c(nrow(HC_te),nrow(Patient))))
+dat$status_sch <- dat$status_trs <- dat$status_ssd <- rep(NA,nrow(dat))
+
+dat$status_sch[test_dat$Data_ID %in% HC_te$Data_ID ] <- "Control"   
+dat$status_sch[test_dat$Data_ID %in% SCZ$Data_ID ] <- "Schizophrenia"
+
+dat$status_ssd[test_dat$Data_ID %in% HC_te$Data_ID  ] <- "Control"
+dat$status_ssd[test_dat$Data_ID %in% SSD$Data_ID ] <- "FE-SSD"
+
+dat$status_trs[test_dat$Data_ID %in% HC_te$Data_ID  ] <- "Control"
+dat$status_trs[test_dat$Data_ID %in% TRS$Data_ID ] <- "TRS"
+
+
+
+#mean sd
+dat %>% dplyr::select(Brain_PAD,c_Brain_PAD,status_sch) %>% group_by(status_sch) %>% summarise_each(funs(mean,sd))
+dat %>% dplyr::select(Brain_PAD,c_Brain_PAD,status_ssd) %>% group_by(status_ssd) %>% summarise_each(funs(mean,sd))
+dat %>% dplyr::select(Brain_PAD,c_Brain_PAD,status_trs) %>% group_by(status_trs) %>% summarise_each(funs(mean,sd))
+
+
+var.test(dat$c_Brain_PAD~dat$status_sch)
+t.test(dat$c_Brain_PAD~dat$status_sch)
+summary(res_aov <- aov(dat$c_Brain_PAD~dat$status_sch))
+
+
+dat2 <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:209)
+dat[replicated,]
+
+dat2 <- rbind(dat2,dat[replicated,])
+dat2[replicated,]$status_ssd <- NA
+dat2[(nrow(dat2)-1):nrow(dat2),]$status_trs <- NA
+
+table(dat2$status_trs)
+table(dat2$status_ssd)
+
+dat2$status_ssd[is.na(dat2$status_ssd)] = dat2$status_trs[is.na(dat2$status_ssd)]
+summary(res_aov <- aov(dat2$Brain_PAD~dat2$status_ssd))
+pairwise.t.test(dat2$Brain_PAD,dat2$status_ssd, p.adj = "fdr")$p.value
+pairwise.t.test(dat2$Brain_PAD,dat2$status_ssd, p.adj = "bonferroni")$p.value
+
+
+# test
+var.test(dat$Brain_PAD~dat$status_sch)
+t.test(dat$Brain_PAD~dat$status_sch)
+summary(res_aov <- aov(dat$Brain_PAD~dat$status_sch))
+
+
+dat2 <- dat
+replicated <- setdiff(which(!is.na(dat$status_trs) & !is.na(dat$status_ssd)),1:209)
+dat[replicated,]
+
+dat2 <- rbind(dat2,dat[replicated,])
+dat2[replicated,]$status_ssd <- NA
+dat2[(nrow(dat2)-1):nrow(dat2),]$status_trs <- NA
+
+table(dat2$status_trs)
+table(dat2$status_ssd)
+
+test_dat2 <- test_dat
+test_dat2 <- rbind(test_dat2,test_dat[replicated,])
+dat2$status_ssd[is.na(dat2$status_ssd)] = dat2$status_trs[is.na(dat2$status_ssd)]
+
+summary(res_aov <- aov(dat2$Brain_PAD~dat2$status_ssd))
+pairwise.t.test(dat2$Brain_PAD,dat2$status_ssd, p.adj = "fdr")$p.value
+pairwise.t.test(dat2$Brain_PAD,dat2$status_ssd, p.adj = "bonferroni")$p.value
+
+
+
+# estimation
+summary(lm(Brain_PAD~status_sch+test_dat$age+test_dat$Sex, data=dat))
+summary(lm(Brain_PAD~dat2$status_ssd+test_dat2$age+test_dat2$Sex, data=dat2))
+
+
+
+
+################################################# 
+######### Clinical variable correlation ######### 
+################################################# 
+
+library(readxl)
+library(dplyr)
+
+PAD <- read_excel("/home/PAD_final.xlsx")
+PAD <- PAD %>% dplyr::select(SubjID,cPAD_rid,cPAD_svm,cPAD_rvm)
+
+
+################# CNT(인지기능) #################
+
+cnt_scz <- read_excel("2021-CNT_zscore-강채영.xlsx", sheet = 1)
+cnt_ssd <- read_excel("2021-CNT_zscore-강채영.xlsx", sheet = 2)
+cnt_trs <- read_excel("2021-CNT_zscore-강채영.xlsx", sheet = 3)
+
+colnames(PAD)[1] <-colnames(dat)[1] <- colnames(cnt_scz)[1]
+
+
+CNT <- inner_join(inner_join(cnt_scz,PAD,by="freesurfer_ID"),dat[c(1,3)],by="freesurfer_ID")
+CNT <- inner_join(inner_join(cnt_ssd,PAD,by="freesurfer_ID"),dat[c(1,3)],by="freesurfer_ID")
+CNT <- inner_join(inner_join(cnt_trs,PAD,by="freesurfer_ID"),dat[c(1,3)],by="freesurfer_ID")
+
+
+cPAD <- c("cPAD_rid", "cPAD_rvm", "cPAD_svm","c_Brain_PAD")
+vars <- c("Global cognitive function","Attention","Verbal memory","Executive function","Language")
+
+
+CORR=NULL
+CORR_all <- matrix(NA, ncol=3, nrow=5)
+
+for (p in 1:length(cPAD)) {
+  for (i in 1:length(vars)) {
+    n <- sum(!is.na(CNT[,c(vars[i])]))
+    dat_complete <- CNT[complete.cases(CNT[,c(vars[i])]),]
+    dat_complete <- data.matrix(dat_complete)
+    corr <- cor.test(dat_complete[,c(vars[i])], dat_complete[,c(cPAD[p])])
+    corr <- cbind(n,round(corr$estimate,2),round(corr$p.value,4))
+    CORR <-  rbind(CORR,corr)
+  }
+  CORR_all <-  cbind(CORR_all,CORR)
+  CORR <- NULL
+}
+
+rownames(CORR_all) <- vars
+CORR_all[,-c(1:3)]
+
+
+
+pval=NULL
+res=NULL
+
+for (p in 1:length(cPAD)) {
+  for (i in 1:length(vars)) {
+    dat_complete <- CNT[complete.cases(CNT[,c(vars[i])]),]
+    dat_complete <- data.matrix(dat_complete)
+    corr <- cor.test(dat_complete[,c(vars[i])], dat_complete[,c(cPAD[p])])$p.value
+    pval <- c(pval,corr)
+  }
+  fdr <- p.adjust(pval,method = "fdr")
+  bon <- p.adjust(pval,method = "bonferroni")
+  res <- cbind(res,c(fdr,bon))
+  pval=NULL
+}
+rownames(res) <- rep(vars,2)
+colnames(res) <- cPAD
+res
+
+
+
+
+########### demo and clinical ############
+
+Patient <- read_excel("Patient clinical information.xlsx", sheet = 1) # N=292
+clinical <- cbind(Patient[,2],as.data.frame(sapply(Patient[,c(5:6,10:18,26)], as.numeric)))
+colnames(clinical)[1] <- "freesurfer_ID"
+
+SFCN_scz <- dat[c(1,3)] %>% filter(dat$status_sch=="Schizophrenia")
+SFCN_ssd <- dat[c(1,3)] %>% filter(dat$status_ssd=="FE-SSD")
+SFCN_trs <- dat[c(1,3)] %>% filter(dat$status_trs=="TRS")
+
+colnames(SFCN_scz)[1] <- "freesurfer_ID"; colnames(SFCN_ssd)[1] <- "freesurfer_ID"; colnames(SFCN_trs)[1] <- "freesurfer_ID"
+
+clinical <- inner_join(inner_join(clinical,PAD,by="freesurfer_ID"),SFCN_scz,by="freesurfer_ID")
+clinical <- inner_join(inner_join(clinical,PAD,by="freesurfer_ID"),SFCN_ssd,by="freesurfer_ID")
+clinical <- inner_join(inner_join(clinical,PAD,by="freesurfer_ID"),SFCN_trs,by="freesurfer_ID")
+str(clinical)
+
+cPAD <- c("cPAD_rid", "cPAD_rvm", "cPAD_svm","c_Brain_PAD")
+vars <- c("DUP","DI","PANSS_Total","P_Total","N_Total","G_Total","CDSS_Total","SOFAS","CPZ","ETI_Total")
+
+# Pearson correlation
+CORR=NULL
+CORR_all <- matrix(NA, ncol=3, nrow=10)
+
+for (p in 1:length(cPAD)) {
+  for (i in 1:length(vars)) {
+    n <- sum(!is.na(clinical[,c(vars[i])]))
+    dat_complete <- clinical[complete.cases(clinical[,c(vars[i])]),]
+    dat_complete <- data.matrix(dat_complete)
+    corr <- cor.test(dat_complete[,c(vars[i])], dat_complete[,c(cPAD[p])])
+    corr <- cbind(n,round(corr$estimate,2),round(corr$p.value,4))
+    CORR <-  rbind(CORR,corr)
+  }
+  CORR_all <-  cbind(CORR_all,CORR)
+  CORR <- NULL
+}
+
+rownames(CORR_all) <- vars
+CORR_all <- CORR_all[,-c(1:3)]
+CORR_all
+
+
+
+# multiple testing correction
+
+pval=NULL
+res=NULL
+
+for (i in 1:length(vars)) {
+  for (p in 1:length(cPAD)) {
+    dat_complete <- clinical[complete.cases(clinical[,c(vars[i])]),]
+    dat_complete <- data.matrix(dat_complete)
+    corr <- cor.test(dat_complete[,c(vars[i])], dat_complete[,c(cPAD[p])])$p.value
+    pval <- c(pval,corr)
+  }
+  fdr <- p.adjust(pval,method = "fdr")
+  bon <- p.adjust(pval,method = "bonferroni")
+  res <- rbind(res,c(fdr,bon))
+  pval=NULL
+}
+rownames(res) <- vars
+colnames(res) <- rep(cPAD,2)
+res
+
+
